@@ -94,7 +94,7 @@ else:
 
 logger = logging.getLogger("cliclo")
 
-VERSION = "5.1"
+VERSION = "5.1.1"
 SCHEMA_VERSION = 6
 
 BANNER_WIDTH = 63
@@ -182,8 +182,11 @@ CT_STATUS_SUCCESS = {"success", "existing_tags"}
 CT_STATUS_PERMANENT = {"read_failure", "write_permission_failure"}
 # ComicTagger MatchStatus values: good_match, no_match, multiple_match, low_confidence_match
 
-# Strings that, in a fetch_data_failure, indicate the velocity / hourly limit
-RATE_LIMIT_SIGNALS = ("rate limit", "slow down", "420", "status_code\": 107", "107")
+# Strings that, in a fetch_data_failure, indicate the velocity / hourly limit.
+# These are matched as substrings of ComicTagger's raw output, which includes the
+# file path — so they must be specific. A bare "107" or "420" would misclassify any
+# fetch failure on a file like "Batman 107.cbz" as a rate limit.
+RATE_LIMIT_SIGNALS = ("rate limit", "slow down", "status_code\": 107", "http 420")
 
 # ---------------------------------------------------------------------------
 # Defaults. Credentials are intentionally blank: set them in cliclo.ini
@@ -338,10 +341,8 @@ class PushoverNotifier:
 
     # -- semantic notifications --------------------------------------------
 
-    def notify_startup(self, total_files: int, resume: bool = False):
-        icon = "\U0001f504" if resume else "\U0001f680"
-        action = "Resuming" if resume else "Starting"
-        msg = (f"{icon} <b>{action} comic tagging</b>\n"
+    def notify_startup(self, total_files: int):
+        msg = (f"\U0001f680 <b>Starting comic tagging</b>\n"
                f"\U0001f4da {total_files:,} files to process\n"
                f"\u23f0 Started {datetime.now().strftime('%H:%M')}")
         self.send(msg, title="CLICLO Started", sound="bike")
@@ -635,16 +636,10 @@ class CLICLODatabase:
 
     # -- failed files ------------------------------------------------------
 
-    def get_failed_files(self, include_permanent: bool = False):
-        if include_permanent:
-            return self.conn.execute("""
-                SELECT filepath, status, retry_count, error_message
-                FROM processed_files WHERE status IN ('error', 'permanent_error')
-                ORDER BY processed_at DESC
-            """).fetchall()
+    def get_failed_files(self):
         return self.conn.execute("""
             SELECT filepath, status, retry_count, error_message
-            FROM processed_files WHERE status = 'error'
+            FROM processed_files WHERE status IN ('error', 'permanent_error')
             ORDER BY processed_at DESC
         """).fetchall()
 
@@ -843,7 +838,6 @@ class CLICLOTagger:
         )
 
     def _check_version(self):
-        import re
         try:
             out = subprocess.run([str(self.exe), "--version"],
                                  capture_output=True, text=True, timeout=15)
@@ -922,6 +916,10 @@ class CLICLOTagger:
         setups pick the first key that is both under budget and not in a velocity
         cooldown; if none qualifies, wait until the soonest one frees up. The budget
         is per key because ComicVine's limit is per user/key."""
+        if not self.api_keys:
+            # Fail fast instead of looping forever waiting on a key list that is empty.
+            raise RuntimeError("No ComicVine API key configured. Run --init-config and set "
+                               "comicvine_api_key, or set CLICLO_COMICVINE_API_KEY.")
         budget = self.safe_invocations * self.calls_per_invocation
         notified = False
         while True:
@@ -1350,7 +1348,6 @@ class CLICLOTagger:
 
     @staticmethod
     def _series_from_filename(stem: str) -> str:
-        import re
         # Drop a trailing issue number and anything after it, and any (year) tail.
         s = re.sub(r"\s*\(\d{4}\).*$", "", stem)          # strip (2020)...
         s = re.sub(r"\s+#?\d+.*$", "", s)                  # strip ' 001 ...' / ' #12 ...'
@@ -1385,6 +1382,11 @@ class CLICLOTagger:
         if not self.comics_path:
             logger.error("No comics path set. Pass one as an argument, set comics_path "
                          "in cliclo.ini, or set CLICLO_COMICS_PATH.")
+            return
+        if not self.api_keys:
+            logger.error("No ComicVine API key configured; online tagging cannot run. "
+                         "Run --init-config and set comicvine_api_key, or set "
+                         "CLICLO_COMICVINE_API_KEY.")
             return
         comics = self.get_comic_files(self.comics_path, include_cbr=True)
 
@@ -1561,6 +1563,9 @@ class CLICLOTagger:
     def process_auto_retry(self):
         """Second pass. Re-match the leftover queue with broadened search,
         keeping the confidence bar. Unresolved files stay queued for --review."""
+        if not self.api_keys:
+            logger.error("No ComicVine API key configured; --auto-retry needs one to re-match.")
+            return
         queue = self.db.get_low_confidence_files()
         if not queue:
             logger.info("Review queue is empty; nothing to auto-retry.")
@@ -1698,7 +1703,7 @@ class CLICLOTagger:
         logger.info(f"Success rate: {sr:.1f}%")
 
     def show_failed(self):
-        rows = self.db.get_failed_files(include_permanent=True)
+        rows = self.db.get_failed_files()
         if not rows:
             logger.info("No failed files.")
             return
