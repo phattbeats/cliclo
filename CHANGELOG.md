@@ -8,6 +8,28 @@
 
 ---
 
+## ISSUE #5¾ — v5.1.1
+### *"THE AUDIT!"*
+**On sale 2026-07-01**
+
+> **NARRATOR BOX:** *With the library conquered and the code laid bare before the world, one question remained: could the machine withstand its own scrutiny? A full review, line by line! Dead code, EXCISED! Nineteen trials, ENDURED!*
+
+A maintenance issue: full code review, dead-code removal, and a capability test suite run against every offline-testable subsystem.
+
+### Fixed
+- **No more waiting forever on a key that doesn't exist.** With no ComicVine API key configured, the key selector would loop and sleep indefinitely instead of failing. Batch runs (pass 1, `--auto-retry`) now refuse to start with a clear message, and the selector itself fails fast if reached without a key.
+- **Rate-limit detection no longer trips on file names.** The signals `"107"` and `"420"` were matched as bare substrings of ComicTagger's raw output — which includes the file path — so a fetch failure on a comic like `Batman 107.cbz` was misreported as a rate limit (and, in multi-key mode, wrongly benched the key). Signals are now specific (`rate limit`, `slow down`, `status_code": 107`, `http 420`).
+
+### Removed (dead code)
+- Duplicate function-local `import re` in `_check_version` and `_series_from_filename` (already imported at module scope).
+- Unused `resume` parameter on the startup notification (never passed).
+- Unused `include_permanent=False` branch of `get_failed_files` (every caller wanted both).
+
+### Verified
+- 19-check capability test pass: config scaffolding + env overrides, JSON result extraction, the full outcome-classification matrix, rate-limit signal specificity, series-name parsing, YAML quoting, database upsert/retry/queue/budget/lock semantics, v3.2 → v6 schema migration with backup and `needs_followup` backfill, tolerant CBZ repack (pages-only, deterministic), Pushover credential self-disable and milestone ladder, and the dedupe regex. Plus CLI smoke: `--help`, `--init-config`, `--stats`, and the new no-key guard.
+
+---
+
 ## ISSUE #5½ — v5.1.0
 ### *"THE HUMAN IN THE LOOP!"*
 **On sale 2026-05-31**
