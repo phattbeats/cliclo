@@ -8,6 +8,28 @@
 
 ---
 
+## ISSUE #5⅞ — v5.1.2
+### *"THE DRY RUN THAT WASN'T!"*
+**On sale 2026-07-01**
+
+> **NARRATOR BOX:** *The audit passed — or so they believed! But lurking beneath the green checkmarks, a preview mode that left FINGERPRINTS! A second sweep, and this time NOTHING escapes!*
+
+A second full-review pass over v5.1.1.
+
+### Fixed
+- **`--dry-run` is now actually a dry run.** Previously a dry run still (1) converted CBR files on disk, (2) wrote `success`/`error`/`skipped` rows into the progress database, and (3) updated the review queue — so files "previewed" in a dry run were silently skipped by the next real run, left untagged forever. A dry run now reports every outcome but touches neither your files nor the database, in pass 1 and `--auto-retry` alike.
+- **Uppercase extensions are no longer invisible on Linux/macOS.** The scan globbed `*.cbz`/`*.cbr` case-sensitively, so `FILE.CBZ` was skipped entirely on case-sensitive filesystems (Windows globbing is case-insensitive, which masked it). Discovery and `--dedupe` now match extensions case-insensitively.
+- **The API key's first six characters no longer land in the log.** The pass-2 banner printed `key abc123…`; everywhere else CLICLO deliberately logs only a last-4 fingerprint. The banner now uses the same fingerprint, so `cliclo.log` never contains a usable key prefix.
+
+### Docs
+- `requirements.txt` claimed pure stdlib; Pushover notifications actually need `requests` (they self-disable without it). Documented as an optional install.
+
+### Verified
+- `py_compile` + pyflakes + vulture clean (no dead code found this pass — v5.1.1 got it all).
+- Behavior checks: case-insensitive discovery finds `.CBZ`/`.CbR`; a dry-run pass leaves the progress DB byte-identical.
+
+---
+
 ## ISSUE #5¾ — v5.1.1
 ### *"THE AUDIT!"*
 **On sale 2026-07-01**
