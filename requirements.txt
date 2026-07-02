@@ -1,6 +1,5 @@
-# CLICLO itself uses only the Python standard library (Python 3.10+), so there
-# is nothing here for pip to install on CLICLO's behalf. This file documents the
-# external tools CLICLO drives.
+# CLICLO's core pipeline uses only the Python standard library (Python 3.10+).
+# This file documents the external tools CLICLO drives plus one optional extra.
 #
 # REQUIRED: the ComicTagger CLI, 1.6.0b11 or newer, on your PATH.
 # The 1.6 line is still a pre-release, and the 1.5.x CLI is NOT compatible, so
@@ -13,3 +12,9 @@
 # true-RAR CBRs are skipped and ZIP-format .cbr files still convert fine:
 #
 #     pip install rarfile
+#
+# OPTIONAL: Pushover phone notifications need the requests library. Without it
+# (or without credentials in cliclo.ini) notifications quietly self-disable and
+# everything else runs normally:
+#
+#     pip install requests

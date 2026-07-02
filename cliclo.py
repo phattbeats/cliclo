@@ -94,7 +94,7 @@ else:
 
 logger = logging.getLogger("cliclo")
 
-VERSION = "5.1.1"
+VERSION = "5.1.2"
 SCHEMA_VERSION = 6
 
 BANNER_WIDTH = 63
@@ -968,9 +968,10 @@ class CLICLOTagger:
     def get_comic_files(self, root: Path, include_cbr: bool = True) -> List[Path]:
         exts = {".cbz", ".cbr"} if include_cbr else {".cbz"}
         logger.info(f"Scanning {root} ...")
-        all_files: List[Path] = []
-        for ext in exts:
-            all_files.extend(root.rglob(f"*{ext}"))
+        # Match extensions case-insensitively: rglob("*.cbz") would miss FILE.CBZ on
+        # Linux/macOS (Windows globbing is case-insensitive, which masked this).
+        all_files: List[Path] = [f for f in root.rglob("*")
+                                 if f.suffix.lower() in exts and f.is_file()]
         seen = self.db.seen_paths()
         todo = [f for f in all_files if str(f) not in seen]
         logger.info(f"Found {len(all_files):,} comics; {len(todo):,} new (rest already in DB)")
@@ -1416,7 +1417,10 @@ class CLICLOTagger:
         # Phase 1: CBR -> CBZ
         if convert_cbr:
             cbrs = [c for c in comics if c.suffix.lower() == ".cbr"]
-            if cbrs:
+            if cbrs and self.dry_run:
+                # A dry run must not rewrite archives on disk (or record conversions).
+                logger.info(f"DRY RUN: would convert {len(cbrs)} CBR files; skipping conversion")
+            elif cbrs:
                 logger.info(f"\n{'=' * 60}\nPHASE 1: converting {len(cbrs)} CBR files\n{'=' * 60}")
                 if not (shutil.which("unrar") or shutil.which("unar") or shutil.which("bsdtar")):
                     logger.warning("  No unrar tool (unrar/unar/bsdtar) found on PATH. True RAR "
@@ -1447,7 +1451,7 @@ class CLICLOTagger:
         # Phase 2: tag
         total = len(comics)
         s_ok = s_err = s_skip = s_follow = 0
-        logger.info(f"\nPHASE 2: tagging {total} comics  (key {self.api_key[:6] or '----'}…, "
+        logger.info(f"\nPHASE 2: tagging {total} comics  (key …{self._key_fp(self.api_key)}, "
                     f"budget ~{self.safe_invocations}/hr)")
         if self.dry_run:
             logger.info("DRY RUN: no files will be modified")
@@ -1465,20 +1469,46 @@ class CLICLOTagger:
             try:
                 if comic.suffix.lower() == ".cbr":
                     logger.warning(f"[{i}/{total}] SKIP (CBR, unwritable): {comic.name}")
-                    self.db.mark_processed(str(comic), "skipped", "CBR format")
-                    self.db.increment_stat("cbr_skipped")
+                    if not self.dry_run:
+                        self.db.mark_processed(str(comic), "skipped", "CBR format")
+                        self.db.increment_stat("cbr_skipped")
                     s_skip += 1
                     continue
 
                 if self.db.get_retry_count(str(comic)) >= self.max_retries:
                     logger.warning(f"[{i}/{total}] SKIP (max retries): {comic.name}")
-                    self.db.increment_stat("skip")
+                    if not self.dry_run:
+                        self.db.increment_stat("skip")
                     s_skip += 1
                     continue
 
                 logger.info(f"[{i}/{total}] {comic.name}")
                 result = self.tag_primary(comic)
                 outcome, msg = self._classify(result)
+
+                if self.dry_run:
+                    # Report the outcome but write NOTHING to the progress DB. A dry run
+                    # that recorded 'success' would make the next real run skip the file
+                    # as already done — previewed but never actually tagged.
+                    logger.info(f"  DRY RUN: {outcome}" + (f" ({msg})" if msg else ""))
+                    if outcome == "success":
+                        s_ok += 1
+                        self._consecutive_api_errors = 0
+                    elif outcome == "needs_followup":
+                        s_follow += 1
+                        self._consecutive_api_errors = 0
+                    elif outcome == "api_error":
+                        s_err += 1
+                        self._consecutive_api_errors += 1
+                        if self._consecutive_api_errors >= 3:
+                            self._cooldown(10, reason="consecutive API errors (dry run)")
+                            self._consecutive_api_errors = 0
+                    else:
+                        s_err += 1
+                        self._consecutive_api_errors = 0
+                    time.sleep(0.5)
+                    continue
+
                 converted = str(comic) in self.converted_this_session
                 size_mb = self._size_mb(comic)
                 tw = ",".join(result.tags_written) or None
@@ -1536,12 +1566,13 @@ class CLICLOTagger:
                 # ComicTagger, anything) must never abort the batch. Mark it transient and
                 # keep going; --retry-failed picks it up next time.
                 logger.error(f"  unexpected error, skipping this file: {e}")
-                try:
-                    self.db.mark_processed(str(comic), "error", f"unexpected: {e}")
-                    self.db.increment_retry(str(comic))
-                    self.db.increment_stat("error")
-                except Exception:  # noqa: BLE001
-                    pass
+                if not self.dry_run:
+                    try:
+                        self.db.mark_processed(str(comic), "error", f"unexpected: {e}")
+                        self.db.increment_retry(str(comic))
+                        self.db.increment_stat("error")
+                    except Exception:  # noqa: BLE001
+                        pass
                 s_err += 1
 
             time.sleep(0.5)  # be polite to the velocity detector
@@ -1571,6 +1602,8 @@ class CLICLOTagger:
             logger.info("Review queue is empty; nothing to auto-retry.")
             return
         logger.info(f"\n{'=' * 60}\nPASS 2 (auto-retry): {len(queue)} files\n{'=' * 60}")
+        if self.dry_run:
+            logger.info("DRY RUN: no files or database rows will be modified")
         if self.accept_low_confidence:
             logger.info("--accept-low-confidence is ON: a final pass will accept any match "
                         "without human review.")
@@ -1580,7 +1613,8 @@ class CLICLOTagger:
             path = Path(fp)
             if not path.exists():
                 logger.warning(f"[{i}/{len(queue)}] gone: {path.name}")
-                self.db.remove_low_confidence(fp)
+                if not self.dry_run:
+                    self.db.remove_low_confidence(fp)
                 continue
             logger.info(f"\n[{i}/{len(queue)}] {path.name}  (was: {reason})")
             won = False
@@ -1591,16 +1625,17 @@ class CLICLOTagger:
                 logger.info(f"  trying: {desc}")
                 outcome, msg = self._classify(self._run(cmd))
                 if outcome == "success":
-                    logger.info(f"  OK via {name}")
-                    self.db.mark_processed(fp, "success")
-                    self.db.increment_stat("followup_success")
-                    self.db.remove_low_confidence(fp)
+                    logger.info(f"  OK via {name}" + (" (DRY RUN: not recorded)" if self.dry_run else ""))
+                    if not self.dry_run:
+                        self.db.mark_processed(fp, "success")
+                        self.db.increment_stat("followup_success")
+                        self.db.remove_low_confidence(fp)
                     resolved += 1
                     won = True
                     break
                 logger.info(f"    -> {msg}")
                 time.sleep(0.5)
-            if not won:
+            if not won and not self.dry_run:
                 # Leave it in the queue for the human pass; refresh the reason.
                 self.db.add_low_confidence(fp, f"auto-retry exhausted ({reason})")
         remaining = len(self.db.get_low_confidence_files())
@@ -1731,7 +1766,9 @@ class CLICLOTagger:
             logger.error("No comics_path configured; set it in cliclo.ini.")
             return
         candidates: List[Path] = []
-        for p in self.comics_path.rglob("*.cbz"):
+        for p in self.comics_path.rglob("*"):
+            if p.suffix.lower() != ".cbz" or not p.is_file():
+                continue
             if self._DUP_RE.search(p.name):
                 base = p.with_name(self._DUP_RE.sub(".cbz", p.name))
                 if base.exists():
