@@ -8,6 +8,10 @@ large libraries (tens of thousands of files), unattended runs, and resuming
 cleanly after an interruption. Point it at a folder, walk away, come back to a
 tagged library.
 
+This README is the quick tour. **[DOCS.md](DOCS.md)** is the full reference:
+every command, every flag, every config key, database behavior, rate
+limiting, notifications, and troubleshooting.
+
 It is a single Python file with no third-party dependencies. The only thing it
 needs is the ComicTagger CLI on your PATH.
 
