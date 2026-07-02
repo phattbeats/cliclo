@@ -1,0 +1,31 @@
+# CLICLO config holds your ComicVine API key(s) and proxy. NEVER commit it.
+cliclo.ini
+
+# Progress databases and their migration backups
+*.db
+*.db-journal
+*.db.bak-*
+cliclo_progress.db
+comic_tagger_progress.db
+
+# Logs
+*.log
+cliclo.log
+
+# Repack temp files (should never persist, but just in case)
+*.cbz.repacktmp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

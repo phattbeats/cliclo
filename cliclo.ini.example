@@ -1,0 +1,50 @@
+; CLICLO configuration. Copy this to "cliclo.ini" and fill it in.
+; CLICLO also writes a cliclo.ini with these defaults on first run if none exists.
+;
+; To resume an earlier run, set db_path to that run's database file.
+; comicvine_api_keys is EXPERIMENTAL key rotation: likely violates ComicVine's
+;   rate limit and risks key/IP bans. Leave blank unless you accept that.
+; proxy routes ComicVine calls through an HTTP(S) proxy; same public IP unless
+;   the proxy is chained to a VPN/Tor upstream.
+; rotate_egress (with proxy + 2+ keys) binds each key to its own IP, key 1 direct
+;   and key 2 via proxy. EXPERIMENTAL IP rotation; verify the proxy is a different
+;   public IP first and own the ban risk.
+; Keep your real cliclo.ini out of version control (it is in .gitignore).
+
+[cliclo]
+; Path to the ComicTagger executable. Blank => discovered on PATH.
+comictagger_path =
+
+; Root folder of your comic library (scanned recursively).
+comics_path =
+
+; Your ComicVine API key (https://comicvine.gamespot.com/api/).
+comicvine_api_key =
+
+; EXPERIMENTAL extra keys, comma-separated. See warning above. Leave blank.
+comicvine_api_keys =
+
+; Conservative hourly pacing. ComicVine allows ~200 requests/resource/hour.
+safe_invocations_per_hour = 50
+api_calls_per_invocation = 4
+max_retries = 3
+
+; ComicTagger metadata style to write. CR (ComicInfo.xml) is the stock default.
+tag_format = CR
+
+; Attempt a tolerant repack when a normal conversion fails on a recoverable
+; problem (corrupt timestamp, odd container). All-or-nothing; never partial.
+repair_failed_archives = true
+
+; EXPERIMENTAL proxy + egress rotation. See warnings above. Leave blank/false.
+proxy =
+rotate_egress = false
+
+; Progress database. Point this at a prior run's DB to resume it.
+db_path = cliclo_progress.db
+
+; Pushover notifications (optional).
+pushover_api_token =
+pushover_user_key =
+pushover_device =
+pushover_enabled = true

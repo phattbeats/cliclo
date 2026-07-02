@@ -1,0 +1,15 @@
+# CLICLO itself uses only the Python standard library (Python 3.10+), so there
+# is nothing here for pip to install on CLICLO's behalf. This file documents the
+# external tools CLICLO drives.
+#
+# REQUIRED: the ComicTagger CLI, 1.6.0b11 or newer, on your PATH.
+# The 1.6 line is still a pre-release, and the 1.5.x CLI is NOT compatible, so
+# install it explicitly with --pre:
+#
+#     pip install --pre "comictagger>=1.6.0b11"
+#
+# OPTIONAL: real RAR (.cbr) extraction. rarfile is only a Python shim; you ALSO
+# need an unrar binary on PATH (UnRAR.exe from rarlab, or WinRAR). Without it,
+# true-RAR CBRs are skipped and ZIP-format .cbr files still convert fine:
+#
+#     pip install rarfile
