@@ -30,6 +30,39 @@ A second full-review pass over v5.1.1.
 
 ---
 
+## ISSUE #6 — v5.1.3
+### *"THE PACKAGE!"*
+**On sale 2026-07-13**
+
+> **NARRATOR BOX:** *No longer a script on GitHub — now a PRODUCT! Pipx-installable, XDG-compliant, state files OUT of the working directory! Secrets scrubbed from logs! A zip bomb can no longer OOM the repack! The audit's recommendations, distilled into a single sweeping change!*
+
+Packaging + distribution + state-handling hardening. This is the release that makes `pipx install cliclo` actually work, and the first one where CLICLO behaves like a real installable tool instead of a script you run from the repo.
+
+### Distribution & packaging
+- **`pyproject.toml` shipped** — single-module layout (`cliclo.py` → `cliclo` import), `[project.scripts]` exposes `cliclo = "cliclo:main"`. Installable via `pip install .`, `pipx install .`, or `pipx install cliclo` once published. Optional extras: `cliclo[pushover]` (Pushover notifications), `cliclo[rar]` (CBR extraction), `cliclo[all]` (both). The base install stays stdlib-only.
+- **`--version` flag** — prints `cliclo 5.1.3`, suitable for cron / scripting / version pinning.
+
+### State handling (no more CWD litter)
+- **`--config-dir <dir>`** — explicit override for the directory holding `cliclo.ini`, `cliclo_progress.db`, and `cliclo.log`. Highest priority.
+- **Default state directory follows the platform convention**: `~/.config/cliclo/` on Linux/BSD (`XDG_CONFIG_HOME` honored if set), `~/Library/Application Support/CLICLO/` on macOS, `%LOCALAPPDATA%\CLICLO\` on Windows. Pipx users no longer "lose" their progress DB to a transient CWD.
+- **Legacy CWD fallback** — if `cliclo.ini` / `cliclo_progress.db` / `comic_tagger_progress.db` already exist in CWD, CLICLO uses CWD (preserves in-place upgrades from pre-v5.1.3 runs).
+- **The log file is now in the state directory, not CWD.** Previously `logging.FileHandler("cliclo.log")` always wrote to CWD regardless of `--config-dir`; now it follows the same resolution path as the config and DB.
+
+### Security
+- **`configparser` interpolation disabled.** API keys and proxy URLs containing `%` no longer raise `InterpolationSyntaxError` at startup. Both load and write paths use `ConfigParser(interpolation=None)`.
+- **ComicVine API keys redacted from ComicTagger stdout/stderr capture.** `CTResult.raw` is scrubbed of every loaded key (full key + 12-char prefix) at capture time, so any downstream log line / `--test` print is automatically safe. A `…last4` fingerprint is preserved in the redaction marker for log correlation.
+
+### Robustness
+- **Repair/decompressed-size guard.** The CBR→CBZ repair pass now sums `infolist()` decompressed sizes before reading any member, so a 500 MB cap actually means 500 MB of uncompressed image data — not 500 MB compressed that could decompress to 50 GB.
+- **Repair streams members instead of buffering the whole archive.** Peak RAM during repair is now "one page" instead of "the whole CBZ."
+- **Repair preserves pages across name collisions.** If two pages share a basename in different subdirectories (`ch1/01.jpg` and `ch2/01.jpg`), the previous code silently dropped all but the first; CLICLO now sanitizes the relative path and keeps every page.
+
+### Verified
+- `python -m py_compile cliclo.py` clean.
+- Smoke: `--version`, `--help`, `--init-config` against a fresh `--config-dir`, and a `--db-info` invocation against the scaffolded config — all leave CWD untouched, all route log/config/DB into the configured state directory.
+
+---
+
 ## ISSUE #5¾ — v5.1.1
 ### *"THE AUDIT!"*
 **On sale 2026-07-01**
