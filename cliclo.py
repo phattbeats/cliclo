@@ -94,7 +94,7 @@ else:
 
 logger = logging.getLogger("cliclo")
 
-VERSION = "5.1.2"
+VERSION = "5.1.3"
 SCHEMA_VERSION = 6
 
 BANNER_WIDTH = 63
@@ -235,13 +235,94 @@ DEFAULTS = {
 }
 
 CONFIG_FILE = "cliclo.ini"
+CONFIG_DIR_LOG = "cliclo.log"
+CONFIG_DIR_DB = "cliclo_progress.db"
+
+
+def default_state_dir() -> str:
+    """Return the platform-appropriate per-user state directory for CLICLO.
+
+    Follows the XDG Base Directory spec on Linux, the OS-native locations on
+    macOS and Windows, and falls back to a dotfile in $HOME if none of the
+    usual env vars are set (e.g. stripped container). Created-on-demand by the
+    caller; this function does NOT mkdir.
+    """
+    # XDG_CONFIG_HOME wins if set, even on macOS/Windows — explicit is explicit.
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(xdg, "cliclo")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/CLICLO")
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(local, "CLICLO")
+    # Linux/BSD/etc.: ~/.config/cliclo
+    return os.path.expanduser("~/.config/cliclo")
+
+
+def resolve_state_dir(args) -> str:
+    """Pick the state directory for this run.
+
+    Resolution order:
+      1. Explicit --config-dir (highest priority).
+      2. CWD if any legacy state file (`cliclo.ini`, `cliclo_progress.db`,
+         `comic_tagger_progress.db`) already lives there — preserves the
+         pre-v5.1.2 behavior for users upgrading in place.
+      3. The platform default (see ``default_state_dir``).
+    """
+    if getattr(args, "config_dir", None):
+        return os.path.abspath(args.config_dir)
+    for legacy in (CONFIG_FILE, CONFIG_DIR_DB, "comic_tagger_progress.db"):
+        if os.path.exists(legacy):
+            return os.getcwd()
+    return default_state_dir()
+
+
+def resolve_config_path(args, state_dir: str) -> str:
+    """Pick the cliclo.ini path: --config wins, else state_dir/cliclo.ini.
+
+    Falls back to legacy CWD ``cliclo.ini`` when present (existing users
+    upgrading in place) so we never silently strand an existing config.
+    """
+    explicit = getattr(args, "config", None)
+    # argparse default is CONFIG_FILE (which is the bare filename "cliclo.ini"),
+    # so a None-or-equal-to-default means "not set on the command line".
+    if explicit and explicit != CONFIG_FILE:
+        return explicit
+    legacy_cwd = os.path.join(os.getcwd(), CONFIG_FILE)
+    if os.path.exists(legacy_cwd):
+        return legacy_cwd
+    return os.path.join(state_dir, CONFIG_FILE)
+
+
+def resolve_db_path(args, config: dict, state_dir: str) -> str:
+    """Pick the progress DB path: explicit --db-path wins, else config, else state-dir default.
+
+    ``config["db_path"]`` is the value loaded from cliclo.ini — if the user set
+    ``db_path`` there we honor it; otherwise we use ``state_dir/cliclo_progress.db``
+    unless a legacy DB lives in CWD (in which case CWD wins for back-compat).
+    """
+    explicit = getattr(args, "db_path", None)
+    if explicit:
+        return explicit
+    cfg_db = config.get("db_path", "").strip()
+    if cfg_db and cfg_db != CONFIG_DIR_DB:
+        return cfg_db
+    for legacy in (CONFIG_DIR_DB, "comic_tagger_progress.db"):
+        if os.path.exists(legacy):
+            return os.path.abspath(legacy)
+    return os.path.join(state_dir, CONFIG_DIR_DB)
 
 
 def load_config(config_file: str = CONFIG_FILE) -> Dict[str, str]:
     """defaults -> config file -> environment variables (CLICLO_<KEY>)."""
+    # interpolation=None: secrets, proxy URLs and percent-encoded tokens often contain '%'
+    # (e.g. a key with a '%' in it, or a URL with query-string encoding). The default
+    # configparser would raise InterpolationSyntaxError on the first such value and abort
+    # startup. None disables %(name)s expansion entirely; we don't rely on it.
     config = dict(DEFAULTS)
     if os.path.exists(config_file):
-        cp = configparser.ConfigParser()
+        cp = configparser.ConfigParser(interpolation=None)
         cp.read(config_file, encoding="utf-8")
         if cp.has_section("cliclo"):
             for key in config:
@@ -255,7 +336,8 @@ def load_config(config_file: str = CONFIG_FILE) -> Dict[str, str]:
 
 
 def write_default_config(path: str):
-    cp = configparser.ConfigParser()
+    # Match load_config: never let '%' in defaults round-trip through interpolation.
+    cp = configparser.ConfigParser(interpolation=None)
     cp.add_section("cliclo")
     for k, v in DEFAULTS.items():
         cp.set("cliclo", k, v)
@@ -1121,9 +1203,15 @@ class CLICLOTagger:
         missing pages. Returns the new .cbz path, or None if the file can't be salvaged."""
         import zipfile
         IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".avif"}
+        # Both guards use the SAME cap. The 500 MB compressed check is fast and avoids
+        # wasting I/O on archives we're going to refuse anyway. The decompressed check is
+        # the actual safety against zip bombs / huge CBZs — it's the SUM of the
+        # uncompressed sizes, evaluated BEFORE we read any member, so a hostile archive
+        # can't OOM us just by listing it.
+        SIZE_CAP_MB = 500
 
-        if self._size_mb(src) > 500:
-            logger.error(f"    Repair skipped (>500 MB): {src.name}")
+        if self._size_mb(src) > SIZE_CAP_MB:
+            logger.error(f"    Repair skipped (>{SIZE_CAP_MB} MB compressed): {src.name}")
             return None
         try:
             with open(src, "rb") as fh:
@@ -1132,14 +1220,28 @@ class CLICLOTagger:
             logger.error(f"    Repair could not open {src.name}: {e}")
             return None
 
-        names_data: List[Tuple[str, bytes]] = []
+        # Phase 1: list members, compute decompressed total, detect name collisions.
+        # We never read a member's bytes until we've confirmed the archive is under the
+        # decompressed cap. That keeps the worst case "list the central directory" (a few
+        # KB) instead of "buffer N GB into RAM before refusing."
         try:
             if magic[:4] == b"PK\x03\x04":
                 with zipfile.ZipFile(src) as zf:
-                    members = [n for n in zf.namelist()
-                               if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXT]
-                    for n in members:
-                        names_data.append((Path(n).name, zf.read(n)))
+                    entries = []
+                    decompressed_total = 0
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        if Path(info.filename).suffix.lower() not in IMAGE_EXT:
+                            continue
+                        decompressed_total += info.file_size
+                        entries.append(info)
+                    if decompressed_total > SIZE_CAP_MB * 1024 * 1024:
+                        logger.error(
+                            f"    Repair skipped (>{SIZE_CAP_MB} MB decompressed total, "
+                            f"{decompressed_total / (1024 * 1024):.0f} MB): {src.name}")
+                        return None
+                    page_source = ("zip", zf, entries)
             elif magic[:4] == b"Rar!":
                 if not (shutil.which("unrar") or shutil.which("unar") or shutil.which("bsdtar")):
                     return None   # RAR needs an extractor; Phase-1 already warned about this
@@ -1148,36 +1250,117 @@ class CLICLOTagger:
                 except ImportError:
                     return None
                 with rarfile.RarFile(src) as rf:
-                    members = [n for n in rf.namelist()
-                               if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXT]
-                    for n in members:
-                        names_data.append((Path(n).name, rf.read(n)))
+                    entries = []
+                    decompressed_total = 0
+                    # rarfile's RarInfo exposes file_size (uncompressed); fall back to
+                    # compress_size if a particular build doesn't populate it.
+                    for info in rf.infolist():
+                        if info.is_dir():
+                            continue
+                        if Path(info.filename).suffix.lower() not in IMAGE_EXT:
+                            continue
+                        size = getattr(info, "file_size", 0) or getattr(info, "compress_size", 0)
+                        decompressed_total += size
+                        entries.append(info)
+                    if decompressed_total > SIZE_CAP_MB * 1024 * 1024:
+                        logger.error(
+                            f"    Repair skipped (>{SIZE_CAP_MB} MB decompressed total, "
+                            f"{decompressed_total / (1024 * 1024):.0f} MB): {src.name}")
+                        return None
+                    page_source = ("rar", rf, entries)
             else:
                 logger.error(f"    Repair can't read {src.name}: not a ZIP or RAR container "
                              f"(magic {magic[:4]!r}).")
                 return None
         except Exception as e:  # noqa: BLE001
-            logger.error(f"    Repair failed to extract {src.name}: {e}")
+            logger.error(f"    Repair failed to enumerate {src.name}: {e}")
             return None
 
-        if not names_data:
+        kind, container, entries = page_source
+        if not entries:
             logger.error(f"    Repair found no page images in {src.name}; leaving it alone.")
             return None
 
+        # Phase 2: rewrite names so no two members collide. We default to the basename only
+        # (most readers prefer flat layouts), but if the archive has siblings with the same
+        # basename in different subdirs — ch1/01.jpg vs ch2/01.jpg — flatten would silently
+        # drop every page after the first duplicate. Detect that and switch to a sanitized
+        # RELATIVE path that preserves the original grouping.
+        def _sanitize(rel: str) -> str:
+            # Strip drive letters / leading slashes, normalize separators, and replace
+            # anything outside [A-Za-z0-9._/-] with '_' so the zip stays portable.
+            rel = rel.replace("\\", "/").lstrip("/")
+            parts = []
+            for piece in rel.split("/"):
+                if not piece or piece in (".", ".."):
+                    piece = "_"   # never emit a '..' — zips treat that as parent traversal
+                # Keep the extension dot intact; nuke other dots-in-filename? No, those are
+                # legal in filenames. Just scrub the truly dangerous chars.
+                cleaned = "".join(c if c.isalnum() or c in "._-" else "_" for c in piece)
+                parts.append(cleaned)
+            return "/".join(parts)
+
+        used_basenames: dict[str, int] = {}
+        used_paths: set[str] = set()
+        out_names: list[tuple] = []
+        collision_detected = False
+        for info in entries:
+            basename = Path(info.filename).name
+            used_basenames.setdefault(basename, 0)
+            used_basenames[basename] += 1
+        for info in entries:
+            basename = Path(info.filename).name
+            if used_basenames[basename] > 1:
+                # Ambiguous basename — preserve a sanitized relative path.
+                collision_detected = True
+                name = _sanitize(info.filename)
+            else:
+                name = basename
+            # Guarantee uniqueness in the output zip even after sanitization (e.g. two
+            # different originals that sanitize to the same string).
+            base = name
+            n = 2
+            while name in used_paths:
+                stem = Path(base).stem
+                suffix = Path(base).suffix
+                name = f"{stem}__{n}{suffix}"
+                n += 1
+            used_paths.add(name)
+            out_names.append((info, name))
+
+        if collision_detected:
+            logger.warning(
+                f"    Repair: {src.name} has duplicate page basenames across subdirs; "
+                f"preserving relative paths to keep all pages.")
+
+        # Phase 3: stream pages one at a time. We read each member, write it, drop the
+        # buffer, then move on — peak RAM is "one page" instead of "the whole archive."
         target = src.with_suffix(".cbz")
         tmp = src.with_suffix(".cbz.repacktmp")
+        written = 0
         try:
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
-                for name, data in sorted(names_data, key=lambda x: x[0]):
-                    zi = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
+                # Sort by the OUTPUT name so the final archive is deterministically ordered
+                # — same source => same target bytes, which makes diffing and debugging
+                # tolerable.
+                for info, out_name in sorted(out_names, key=lambda p: p[1]):
+                    zi = zipfile.ZipInfo(filename=out_name, date_time=(1980, 1, 1, 0, 0, 0))
+                    zi.compress_type = zipfile.ZIP_DEFLATED
+                    if kind == "zip":
+                        with container.open(info, "r") as src_fh:
+                            data = src_fh.read()
+                    else:  # rar
+                        data = container.read(info)
                     out.writestr(zi, data)
+                    written += 1
+                    del data
             os.replace(str(tmp), str(target))
         except Exception as e:  # noqa: BLE001
             logger.error(f"    Repair write failed for {src.name}: {e}")
             self._safe_unlink(tmp)
             return None
 
-        logger.info(f"    Repaired -> {target.name} ({len(names_data)} pages, metadata reset)")
+        logger.info(f"    Repaired -> {target.name} ({written} pages, metadata reset)")
         self.converted_this_session.add(str(target))
         self.db.increment_stat("repaired")
         if src.suffix.lower() == ".cbr" and target != src and not keep_original:
@@ -1230,6 +1413,37 @@ class CLICLOTagger:
         # YAML single-quote escaping: wrap in single quotes, double any internal single quote.
         return "'" + value.replace("'", "''") + "'"
 
+    @staticmethod
+    def _redact_secrets(text: str, secrets: List[str]) -> str:
+        """Replace every occurrence of any secret in `text` with a redaction marker.
+
+        ComicTagger's stdout/stderr sometimes echoes the argv we passed (e.g. on internal
+        `--help`-style error paths, or when an unhandled exception bubbles through argparse),
+        which would land the full ComicVine API key in cliclo.log and on stdout. Scrubbing at
+        capture time keeps every downstream consumer of CTResult.raw safe automatically.
+
+        We also redact any 12+ char prefix of a key, so a partly-typed value still gets
+        scrubbed; the redaction marker preserves the last-4 fingerprint used elsewhere so
+        log readers can still correlate which key was involved.
+        """
+        if not text:
+            return text
+        out = text
+        for secret in secrets:
+            if not secret or len(secret) < 4:
+                continue
+            full = secret
+            # Fingerprint the key the same way _key_fp() does, so log correlation survives.
+            fp = f"…{secret[-4:]}"
+            # Replace full key first (most specific).
+            out = out.replace(full, f"<api-key {fp}>")
+            # Then any 12+ char prefix — catches partial leaks (mid-typed prefixes, key
+            # chunks embedded in tracebacks). 12 chars keeps us well clear of incidental
+            # matches in normal error text.
+            if len(secret) >= 12:
+                out = out.replace(secret[:12], f"<api-key-prefix {fp}>")
+        return out
+
     def _run(self, cmd: List[str], timeout: int = 180) -> CTResult:
         key = self._select_and_wait_key()
         cmd = self._with_key(cmd, key)
@@ -1248,7 +1462,14 @@ class CLICLOTagger:
             self.db.record_api_invocation(self.calls_per_invocation,
                                           key_id=fp if len(self.api_keys) > 1 else None)
 
-        raw = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        # Scrub any loaded API key out of captured output before it hits CTResult.raw.
+        # `self.api_keys` covers ALL keys (rotation pool); a leak from any of them is a
+        # leak.  See _redact_secrets() for the matching strategy (full key + 12-char
+        # prefix).  Done here, once, so every downstream logger.error / logger.info /
+        # --test print is automatically safe.
+        keys_to_redact = [k for k in self.api_keys if k]
+        raw = self._redact_secrets(
+            (proc.stdout or "") + "\n" + (proc.stderr or ""), keys_to_redact)
         obj = _extract_json(proc.stdout or "")
         # Cool a key ONLY when a request actually FAILED on rate limiting. A transient 420
         # that ComicTagger retried through still lands status=success, and the "slow down"
@@ -1844,6 +2065,7 @@ class CLICLOTagger:
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
+        prog="cliclo",
         description=f"CLICLO v{VERSION} — Command Line Interface Comic Library Organizer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -1860,6 +2082,16 @@ def build_parser() -> argparse.ArgumentParser:
             "  cliclo --init-config          Scaffold cliclo.ini\n"
         ),
     )
+    # `--version` is added with `prog=cliclo` above so the standard action="version"
+    # prints "cliclo 5.1.2" instead of argparse's default "<prog>.py 5.1.2". Keeps
+    # `cliclo --version` tidy for cron / scripting.
+    p.add_argument("--version", action="version", version=f"cliclo {VERSION}")
+    p.add_argument("--config-dir",
+                   help="Directory for cliclo.ini, the progress DB, and the log "
+                        "(default: platform-specific user config dir, e.g. "
+                        "~/.config/cliclo on Linux). Falls back to CWD if --config "
+                        "or --db-path is set explicitly, or if legacy state files "
+                        "already live in CWD.")
     p.add_argument("path", nargs="?", help="Comics directory (overrides config)")
     p.add_argument("--comics-path", help="Override comics path")
     p.add_argument("--comictagger-path", help="ComicTagger install dir or binary")
@@ -1941,6 +2173,27 @@ def _warn_if_legacy_db_present(db_path: str, explicit: bool):
 def main():
     args = build_parser().parse_args()
 
+    # Resolve the state directory FIRST so every downstream path (config, db, log) can
+    # use the same canonical location instead of littering CWD. The helpers also handle
+    # the legacy-CWD fallback so users upgrading in place never lose their existing
+    # cliclo.ini / cliclo_progress.db.
+    state_dir = resolve_state_dir(args)
+    args.config = resolve_config_path(args, state_dir)
+
+    # Reconfigure logging to write into the resolved state directory, not CWD. We do
+    # this BEFORE --init-config / first-run scaffolding so the "First run: created ..."
+    # line lands in the new log, and BEFORE any tagger code so every log line benefits.
+    os.makedirs(state_dir, exist_ok=True)
+    log_path = os.path.join(state_dir, CONFIG_DIR_LOG)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(logging.FileHandler(log_path, encoding="utf-8"))
+    root.addHandler(logging.StreamHandler())
+    for h in root.handlers:
+        h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
     if args.init_config:
         write_default_config(args.config)
         print(f"Wrote {args.config}. Edit it to add your ComicVine key, comics path, "
@@ -1957,6 +2210,10 @@ def main():
                     f"arguments / CLICLO_* env vars).")
 
     config = load_config(args.config)
+    # Resolve the actual DB path against the state dir. We only override config["db_path"]
+    # when the user hasn't pinned one (or has the default), so existing resumable runs
+    # keep pointing at the DB they started with.
+    config["db_path"] = resolve_db_path(args, config, state_dir)
     if args.path:
         config["comics_path"] = args.path
     if args.comics_path:
@@ -2033,11 +2290,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # Print the banner before argparse so --help / --version still get a clean exit, but
+    # AFTER we have args. We deliberately defer all logging setup to main() — that way
+    # the log file lands in the resolved state directory (via resolve_state_dir) rather
+    # than polluting CWD with a bare "cliclo.log".
     print_banner()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler("cliclo.log", encoding="utf-8"), logging.StreamHandler()],
-    )
-    logger.info(f"CLICLO v{VERSION}")
     main()
