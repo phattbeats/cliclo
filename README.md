@@ -72,7 +72,7 @@ needs is the ComicTagger CLI on your PATH.
 pip install --pre "comictagger>=1.6.0b11"
 
 # 2. Get CLICLO
-git clone https://github.com/<you>/cliclo.git
+git clone https://github.com/phattbeats/cliclo.git
 cd cliclo
 
 # 3. Create your config (or let the first run scaffold one for you)
