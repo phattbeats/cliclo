@@ -56,6 +56,7 @@ import sqlite3
 import logging
 import platform
 import tempfile
+import uuid
 import argparse
 import threading
 import configparser
@@ -94,7 +95,7 @@ else:
 
 logger = logging.getLogger("cliclo")
 
-VERSION = "5.1.3"
+VERSION = "5.2.0"
 SCHEMA_VERSION = 6
 
 BANNER_WIDTH = 63
@@ -314,6 +315,36 @@ def resolve_db_path(args, config: dict, state_dir: str) -> str:
     return os.path.join(state_dir, CONFIG_DIR_DB)
 
 
+_BOOL_TRUE = {"true", "yes", "on", "1"}
+_BOOL_FALSE = {"false", "no", "off", "0", ""}
+
+
+def config_bool(config: Dict[str, str], key: str) -> bool:
+    """Parse a boolean config value with configparser-style literals. A value that
+    is neither recognizably true nor false gets a loud warning instead of being
+    silently read as false (a user writing `repair_failed_archives = 1` should not
+    have repair switched off behind their back)."""
+    raw = config.get(key, "").strip().lower()
+    if raw in _BOOL_TRUE:
+        return True
+    if raw not in _BOOL_FALSE:
+        logger.warning(f"Config key '{key}' has unrecognized value {config.get(key)!r}; "
+                       f"expected true/false (or yes/no/on/off/1/0). Treating as false.")
+    return False
+
+
+def config_int(config: Dict[str, str], key: str) -> int:
+    """Parse an integer config value, naming the offending key on failure instead
+    of dying with a bare ValueError traceback."""
+    raw = (config.get(key) or "").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        logger.error(f"Config key '{key}' must be a whole number, got {raw!r}. "
+                     f"Fix it in cliclo.ini (or the CLICLO_{key.upper()} env var).")
+        sys.exit(2)
+
+
 def load_config(config_file: str = CONFIG_FILE) -> Dict[str, str]:
     """defaults -> config file -> environment variables (CLICLO_<KEY>)."""
     # interpolation=None: secrets, proxy URLs and percent-encoded tokens often contain '%'
@@ -323,7 +354,11 @@ def load_config(config_file: str = CONFIG_FILE) -> Dict[str, str]:
     config = dict(DEFAULTS)
     if os.path.exists(config_file):
         cp = configparser.ConfigParser(interpolation=None)
-        cp.read(config_file, encoding="utf-8")
+        try:
+            cp.read(config_file, encoding="utf-8")
+        except configparser.Error as e:
+            logger.error(f"Could not parse {config_file}: {e}")
+            sys.exit(2)
         if cp.has_section("cliclo"):
             for key in config:
                 if cp.has_option("cliclo", key):
@@ -514,28 +549,41 @@ class CLICLODatabase:
         self._init_schema()
 
     def _acquire_lock(self):
+        # Open in append mode so we never truncate a file another instance holds,
+        # and report open-failures (permissions, read-only dir) as what they are
+        # instead of a bogus "another instance is running".
         try:
-            self._lock_fh = open(self._lock_path, "w")
+            self._lock_fh = open(self._lock_path, "a")
+        except OSError as e:
+            logger.error(f"Cannot create lock file {self._lock_path}: {e}. "
+                         "Is this directory writable?")
+            sys.exit(1)
+        try:
             _lock_file(self._lock_fh)
         except (OSError, IOError):
-            logger.error(f"Another CLICLO instance appears to be running (lock: {self._lock_path}). "
-                         "If that's wrong, delete the .lock file and retry.")
+            logger.error(f"Another CLICLO instance is already running against this database "
+                         f"(lock: {self._lock_path}). Wait for it to finish, or stop it, "
+                         f"then retry. Only delete the .lock file if you are certain no "
+                         f"other CLICLO process is alive.")
             sys.exit(1)
 
     def _backup_if_legacy(self):
         """If an older-schema DB exists, copy it aside before we migrate it."""
         if not os.path.exists(self.db_path):
             return
+        peek = None
         try:
             peek = sqlite3.connect(self.db_path)
             uv = peek.execute("PRAGMA user_version").fetchone()[0]
             has_pf = peek.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='processed_files'"
             ).fetchone()
-            peek.close()
         except Exception as e:
             logger.warning(f"Could not inspect existing DB for migration backup: {e}")
             return
+        finally:
+            if peek is not None:
+                peek.close()
         if has_pf and uv < SCHEMA_VERSION:
             bak = f"{self.db_path}.bak-v{uv}-{datetime.now():%Y%m%d%H%M%S}"
             try:
@@ -818,7 +866,8 @@ def _extract_json(stdout: str) -> Optional[dict]:
 # Core tagger
 # ---------------------------------------------------------------------------
 class CLICLOTagger:
-    def __init__(self, config: Dict[str, str], pushover: PushoverNotifier):
+    def __init__(self, config: Dict[str, str], pushover: PushoverNotifier,
+                 need_exe: bool = True):
         self.comics_path = Path(config["comics_path"]) if config["comics_path"] else None
         self.comictagger_path = config["comictagger_path"].strip()
         # Effective key list: the single key plus any comma-separated extras, deduped,
@@ -829,14 +878,14 @@ class CLICLOTagger:
         self.api_keys = [k for k in keys if k and not (k in seen_k or seen_k.add(k))]
         self.api_key = self.api_keys[0] if self.api_keys else ""   # default / single-key path
         self._key_cooldowns: Dict[str, datetime] = {}              # fingerprint -> cooldown-until
-        self.safe_invocations = int(config["safe_invocations_per_hour"])
-        self.calls_per_invocation = int(config["api_calls_per_invocation"])
-        self.max_retries = int(config["max_retries"])
+        self.safe_invocations = config_int(config, "safe_invocations_per_hour")
+        self.calls_per_invocation = config_int(config, "api_calls_per_invocation")
+        self.max_retries = config_int(config, "max_retries")
         self.tag_format = self._validate_tag_format(config["tag_format"])
-        self.repair_failed = config.get("repair_failed_archives", "true").strip().lower() == "true"
+        self.repair_failed = config_bool(config, "repair_failed_archives")
         # Egress: a "direct" env (proxy vars stripped) and, if a proxy is set, a "proxy" env.
         self.proxy = config.get("proxy", "").strip()
-        self.rotate_egress = config.get("rotate_egress", "false").strip().lower() == "true"
+        self.rotate_egress = config_bool(config, "rotate_egress")
         _PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
         base = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
         self._env_direct = dict(base)
@@ -854,7 +903,10 @@ class CLICLOTagger:
         self.db = CLICLODatabase(config["db_path"])
         self.pushover = pushover
 
-        self.exe = self._find_executable()
+        # Read-only commands (--stats, --db-info, --show-failed) work straight off the
+        # DB; requiring (and version-probing) the ComicTagger binary for them turns a
+        # stats query on a box without ComicTagger into a crash + emergency page.
+        self.exe = self._find_executable() if need_exe else None
         self.converted_this_session: Set[str] = set()
         self._consecutive_api_errors = 0
         self.dry_run = False
@@ -864,7 +916,8 @@ class CLICLOTagger:
         self._flag_abort = "--abort"
         self._flag_accept = "--no-abort"
         self._has_no_year = True
-        self._resolve_flags()
+        if need_exe:
+            self._resolve_flags()
 
         if len(self.api_keys) > 1:
             fps = ", ".join(self._key_fp(k) for k in self.api_keys)
@@ -886,7 +939,8 @@ class CLICLOTagger:
         if not self.api_key:
             logger.warning("No ComicVine API key set. Online tagging will fail. "
                            "Run --init-config and edit cliclo.ini, or set CLICLO_COMICVINE_API_KEY.")
-        self._check_version()
+        if need_exe:
+            self._check_version()
 
     @staticmethod
     def _validate_tag_format(raw: str) -> str:
@@ -1050,10 +1104,23 @@ class CLICLOTagger:
     def get_comic_files(self, root: Path, include_cbr: bool = True) -> List[Path]:
         exts = {".cbz", ".cbr"} if include_cbr else {".cbz"}
         logger.info(f"Scanning {root} ...")
-        # Match extensions case-insensitively: rglob("*.cbz") would miss FILE.CBZ on
+        # Match extensions case-insensitively: a plain glob would miss FILE.CBZ on
         # Linux/macOS (Windows globbing is case-insensitive, which masked this).
-        all_files: List[Path] = [f for f in root.rglob("*")
-                                 if f.suffix.lower() in exts and f.is_file()]
+        # os.walk with followlinks=True instead of rglob: rglob never descends into
+        # symlinked directories (common on Unraid/mergerfs libraries), silently
+        # skipping whole subtrees. The visited-realpath set breaks symlink cycles.
+        all_files: List[Path] = []
+        visited_dirs: Set[str] = set()
+        for dirpath, dirnames, filenames in os.walk(str(root), followlinks=True):
+            real = os.path.realpath(dirpath)
+            if real in visited_dirs:
+                dirnames[:] = []
+                continue
+            visited_dirs.add(real)
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                if p.suffix.lower() in exts:
+                    all_files.append(p)
         seen = self.db.seen_paths()
         todo = [f for f in all_files if str(f) not in seen]
         logger.info(f"Found {len(all_files):,} comics; {len(todo):,} new (rest already in DB)")
@@ -1103,7 +1170,10 @@ class CLICLOTagger:
         try:
             tmp_dir = Path(tempfile.gettempdir()) / "cliclo_temp"
             tmp_dir.mkdir(exist_ok=True)
-            dest = tmp_dir / src.name
+            # Unique per-call destination: a timed-out copy leaves its daemon thread
+            # still writing, so a retry of the same file must never share the path
+            # with the zombie copy (interleaved writes -> corrupt "local" file).
+            dest = tmp_dir / f"{uuid.uuid4().hex[:8]}-{src.name}"
         except Exception as e:
             logger.error(f"    Temp setup failed: {e}")
             return None
@@ -1129,18 +1199,24 @@ class CLICLOTagger:
         return dest
 
     def _run_conversion(self, cbr: Path, keep_original: bool, timeout: int) -> Optional[Path]:
-        cmd = [str(self.exe), "--no-gui", "-e"]
-        if not keep_original:
-            cmd.append("--delete-original")
-        cmd.append(str(cbr))
+        # NEVER pass --delete-original: ComicTagger would remove the CBR even if the
+        # CBZ it wrote is truncated (disk full, crash mid-write). We verify the output
+        # archive ourselves and only then delete the original.
+        cmd = [str(self.exe), "--no-gui", "-e", str(cbr)]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                                   encoding="utf-8", errors="replace")
             cbz = cbr.with_suffix(".cbz")
             if cbz.exists():
+                if not self._cbz_ok(cbz):
+                    logger.error(f"    Conversion produced a corrupt/partial CBZ "
+                                 f"({cbz.name}); keeping the original CBR untouched.")
+                    return None
                 logger.info(f"    Converted: {cbz.name}")
                 self.converted_this_session.add(str(cbz))
                 self.db.increment_stat("cbr_converted")
+                if not keep_original and cbz != cbr:
+                    self._safe_unlink(cbr)
                 return cbz
             # No CBZ produced. Surface ComicTagger's own reason instead of swallowing it.
             combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
@@ -1335,11 +1411,24 @@ class CLICLOTagger:
 
         # Phase 3: stream pages one at a time. We read each member, write it, drop the
         # buffer, then move on — peak RAM is "one page" instead of "the whole archive."
+        # NOTE: the Phase-1 `with` blocks CLOSED the container, so it must be reopened
+        # here — reading through the closed handle made every repair fail with
+        # "Repair write failed" (ValueError: attempt to use a closed archive).
         target = src.with_suffix(".cbz")
+        if target != src and target.exists():
+            # A .cbz beside this file already exists (possibly already tagged).
+            # Overwriting it with a metadata-reset repack would destroy good work.
+            logger.error(f"    Repair aborted: {target.name} already exists; not overwriting it.")
+            return None
         tmp = src.with_suffix(".cbz.repacktmp")
         written = 0
         try:
-            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+            if kind == "zip":
+                container = zipfile.ZipFile(src)
+            else:  # rar; import succeeded in Phase 1
+                import rarfile
+                container = rarfile.RarFile(src)
+            with container, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
                 # Sort by the OUTPUT name so the final archive is deterministically ordered
                 # — same source => same target bytes, which makes diffing and debugging
                 # tolerable.
@@ -1350,10 +1439,14 @@ class CLICLOTagger:
                         with container.open(info, "r") as src_fh:
                             data = src_fh.read()
                     else:  # rar
-                        data = container.read(info)
+                        data = container.read(info.filename)
                     out.writestr(zi, data)
                     written += 1
                     del data
+            if not self._cbz_ok(tmp):
+                logger.error(f"    Repair produced an invalid archive for {src.name}; discarding it.")
+                self._safe_unlink(tmp)
+                return None
             os.replace(str(tmp), str(target))
         except Exception as e:  # noqa: BLE001
             logger.error(f"    Repair write failed for {src.name}: {e}")
@@ -1366,6 +1459,21 @@ class CLICLOTagger:
         if src.suffix.lower() == ".cbr" and target != src and not keep_original:
             self._safe_unlink(src)
         return target
+
+    @staticmethod
+    def _cbz_ok(path: Path) -> bool:
+        """True only if `path` is a readable, CRC-clean ZIP with at least one member.
+        This is the gate before any original file is deleted or a conversion is
+        recorded as done: a partial CBZ left by a crash/timeout looks fine to
+        `exists()` but fails here."""
+        import zipfile
+        try:
+            with zipfile.ZipFile(str(path), "r") as zf:
+                if not zf.namelist():
+                    return False
+                return zf.testzip() is None
+        except Exception:  # noqa: BLE001  (BadZipFile, OSError, LargeZipFile, ...)
+            return False
 
     @staticmethod
     def _safe_unlink(p: Path):
@@ -1449,18 +1557,26 @@ class CLICLOTagger:
         cmd = self._with_key(cmd, key)
         fp = self._key_fp(key)
         _, env = self._route_for_key(key)
+        charge = True
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                                   env=env, encoding="utf-8", errors="replace")
         except subprocess.TimeoutExpired:
             return CTResult(returncode=-1, status=None, match_status=None,
                             tags_written=[], raw="timeout")
+        except (FileNotFoundError, PermissionError) as e:
+            # The process never launched, so no API call was made -- charging the
+            # hourly budget for a misconfigured exe path would burn it on nothing.
+            charge = False
+            return CTResult(returncode=-1, status=None, match_status=None,
+                            tags_written=[], raw=str(e))
         except Exception as e:  # noqa: BLE001
             return CTResult(returncode=-1, status=None, match_status=None,
                             tags_written=[], raw=str(e))
         finally:
-            self.db.record_api_invocation(self.calls_per_invocation,
-                                          key_id=fp if len(self.api_keys) > 1 else None)
+            if charge:
+                self.db.record_api_invocation(self.calls_per_invocation,
+                                              key_id=fp if len(self.api_keys) > 1 else None)
 
         # Scrub any loaded API key out of captured output before it hits CTResult.raw.
         # `self.api_keys` covers ALL keys (rotation pool); a leak from any of them is a
@@ -1652,12 +1768,21 @@ class CLICLOTagger:
                     # If the CBZ already exists, conversion was done on an earlier run.
                     # Re-running it would overwrite (and blank) the tagged CBZ, so skip it.
                     # Record the CBR as handled so future scans stop re-finding it.
+                    # Verify the CBZ before trusting it: a partial file left by a
+                    # crashed/timed-out conversion (or an unrelated same-stem file) must
+                    # never cause the CBR to be marked handled -- or worse, deleted --
+                    # when that CBR may be the only good copy of the pages.
                     if target.exists():
-                        logger.info(f"  Already converted, skipping: {cbr.name}")
-                        self.db.mark_processed(str(cbr), "converted", "CBZ already present")
-                        comics.remove(cbr)
-                        if not keep_cbr:
-                            self._safe_unlink(cbr)
+                        if self._cbz_ok(target):
+                            logger.info(f"  Already converted, skipping: {cbr.name}")
+                            self.db.mark_processed(str(cbr), "converted", "CBZ already present")
+                            comics.remove(cbr)
+                            if not keep_cbr:
+                                self._safe_unlink(cbr)
+                        else:
+                            logger.warning(f"  {target.name} exists but is corrupt/partial; "
+                                           f"keeping {cbr.name} untouched. Delete the bad CBZ "
+                                           f"and re-run to convert.")
                         continue
                     cbz = self.convert_cbr_to_cbz(cbr, keep_original=keep_cbr)
                     if cbz:
@@ -1922,8 +2047,31 @@ class CLICLOTagger:
                 self.db.increment_stat("review_success")
                 self.db.remove_low_confidence(fp)
                 resolved += 1
+            elif after is not None and after == before:
+                # Tags are present but IDENTICAL to before. Ambiguous: the file may have
+                # shipped with embedded release-group tags, so this is either "user
+                # reconfirmed the same match" or "user skipped". Guessing either way
+                # records the wrong status forever; ask -- this pass is guaranteed to be
+                # on an interactive terminal.
+                ans = ""
+                while ans not in ("t", "s"):
+                    ans = input("  metadata unchanged -- did you tag/confirm this match (t) "
+                                "or skip it (s)? ").strip().lower()
+                if ans == "t":
+                    print("  -> tagged (user reconfirmed existing match)")
+                    self.db.mark_processed(fp, "success", match_status="user_reconfirmed")
+                    self.db.increment_stat("review_success")
+                    self.db.remove_low_confidence(fp)
+                    resolved += 1
+                else:
+                    print("  -> skipped")
+                    self.db.mark_processed(fp, "manual_required", "skipped during review")
+                    self.db.increment_stat("manual_required")
+                    self.db.remove_low_confidence(fp)
+                    manual += 1
             else:
-                # Unchanged: the human skipped, or there was nothing to choose (no_match).
+                # No tags at all after the session: the human skipped, or there was
+                # nothing to choose (no_match).
                 print("  -> skipped / no match chosen")
                 self.db.mark_processed(fp, "manual_required", "skipped during review")
                 self.db.increment_stat("manual_required")
@@ -1976,13 +2124,40 @@ class CLICLOTagger:
                 logger.info(f"  {Path(fp).name}: {em}")
 
     _DUP_RE = re.compile(r" \(\d{1,3}\)\.cbz$", re.IGNORECASE)
+    _DUP_SIZE_TOLERANCE = 0.05  # 5% -- a 'Title (1).cbz' is usually byte-identical
+
+    def _quick_cbz_signature(self, path: Path) -> Optional[Tuple[int, bytes]]:
+        """Cheap fingerprint of a CBZ: (file_size, sha1 of the central directory's
+        per-member (name, size, CRC32) triples). Covers the content of EVERY page
+        without decompressing anything, so two different scans that merely share
+        page 001 / ComicInfo.xml can't collide."""
+        import hashlib
+        import zipfile
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        try:
+            with zipfile.ZipFile(str(path), "r") as zf:
+                entries = sorted((zi.filename, zi.file_size, zi.CRC) for zi in zf.infolist())
+                blob = "|".join(f"{n}:{s}:{c:08x}" for n, s, c in entries) \
+                    .encode("utf-8", errors="replace")
+                return (size, hashlib.sha1(blob).digest()[:16])
+        except (zipfile.BadZipFile, OSError):
+            return None
 
     def dedupe(self, confirm: bool = False):
         """Find and (with confirm) remove the numbered duplicate CBZ files that earlier
         re-conversion runs spawned. A duplicate is 'Title (N).cbz' where a plain
         'Title.cbz' also exists. N is limited to 1-3 digits so 4-digit years like
         'Title (2016).cbz' are never matched. Dry-run unless confirm=True; the base
-        'Title.cbz' is always kept."""
+        'Title.cbz' is always kept.
+
+        Safety: matching on filename alone is dangerous -- 'Title (1).cbz' may actually
+        be a DIFFERENT scan (better quality, a variant cover, etc.). Before deleting,
+        each candidate is compared to its base by size (within tolerance) AND a zip
+        signature covering every member's CRC; anything that doesn't match is reported
+        and left alone."""
         if not self.comics_path:
             logger.error("No comics_path configured; set it in cliclo.ini.")
             return
@@ -2008,19 +2183,50 @@ class CLICLOTagger:
             logger.info("DRY RUN: nothing deleted. Review the list, then re-run with "
                         "`--dedupe --confirm` to delete these and clear their database rows.")
             return
+        # Compute signatures once per base path; one base can have multiple numbered dupes.
+        base_sigs: Dict[Path, Optional[Tuple[int, bytes]]] = {}
         removed = 0
         freed = 0.0
+        skipped_different = 0
         for p in candidates:
+            base = p.with_name(self._DUP_RE.sub(".cbz", p.name))
             mb = self._size_mb(p)
             try:
+                if base not in base_sigs:
+                    base_sigs[base] = self._quick_cbz_signature(base)
+                sig_dup = self._quick_cbz_signature(p)
+                if base_sigs[base] is None or sig_dup is None:
+                    logger.warning(f"  Skipping (could not fingerprint): {p.name}")
+                    continue
+                bsz, bhash = base_sigs[base]
+                dsz, dhash = sig_dup
+                # Size gate first (cheap): a 6 GB vs 80 MB "duplicate" is almost certainly
+                # a different scan, not a duplicate of the base.
+                if bsz > 0 and abs(dsz - bsz) / bsz > self._DUP_SIZE_TOLERANCE:
+                    logger.warning(
+                        f"  Skipping (size differs >{int(self._DUP_SIZE_TOLERANCE * 100)}% "
+                        f"-- likely a different scan): {p.name} ({dsz // 1024} KB) vs "
+                        f"{base.name} ({bsz // 1024} KB)")
+                    skipped_different += 1
+                    continue
+                if dhash != bhash:
+                    logger.warning(
+                        f"  Skipping (content differs -- likely a different scan): {p.name}")
+                    skipped_different += 1
+                    continue
                 p.unlink()
                 self.db.remove_path(str(p))
                 removed += 1
                 freed += mb
             except OSError as e:
                 logger.error(f"  could not delete {p.name}: {e}")
-        logger.info(f"Deleted {removed:,} duplicate CBZ files, freed ~{freed:.0f} MB. "
-                    f"Base files left untouched.")
+        msg = (f"Deleted {removed:,} duplicate CBZ files, freed ~{freed:.0f} MB. "
+               f"Base files left untouched.")
+        if skipped_different:
+            msg += (f" {skipped_different:,} candidate(s) were left alone because their "
+                    f"size or content didn't match the base -- review them manually if "
+                    f"you intended to remove them.")
+        logger.info(msg)
 
     def show_db_info(self):
         logger.info(f"DB: {self.db.db_path}  (schema v{self.db.schema_version()})")
@@ -2236,11 +2442,15 @@ def main():
     # over an existing backlog would re-process thousands of files and burn API budget.
     _warn_if_legacy_db_present(config["db_path"], explicit=bool(args.db_path))
 
-    po_enabled = config["pushover_enabled"].strip().lower() == "true" and not args.no_pushover
+    po_enabled = config_bool(config, "pushover_enabled") and not args.no_pushover
     pushover = PushoverNotifier(config["pushover_api_token"], config["pushover_user_key"],
                                 config["pushover_device"], enabled=po_enabled)
 
     if args.test_pushover:
+        if not pushover.enabled:
+            print("Pushover is disabled (pushover_enabled=false, --no-pushover, or blank "
+                  "credentials in cliclo.ini); nothing sent.")
+            return
         ok = pushover.send("\U0001f9ea <b>CLICLO test</b>\nNotifications are working.",
                            title="CLICLO Test", sound="bike")
         print("Sent." if ok else "Failed; check credentials in cliclo.ini.")
@@ -2255,8 +2465,11 @@ def main():
         _delete_db(config["db_path"])
         logger.info("Starting fresh.")
 
+    tagger = None
     try:
-        tagger = CLICLOTagger(config, pushover)
+        # DB-only commands don't need the ComicTagger binary at all.
+        db_only = args.stats or args.db_info or args.show_failed
+        tagger = CLICLOTagger(config, pushover, need_exe=not db_only)
         tagger.dry_run = args.dry_run
         tagger.accept_low_confidence = args.accept_low_confidence
 
@@ -2278,15 +2491,23 @@ def main():
             tagger.process_all(retry_failed=args.retry_failed,
                                convert_cbr=not args.no_convert_cbr,
                                keep_cbr=not args.delete_cbr)
-
-        tagger.close()
     except KeyboardInterrupt:
         logger.info("\nInterrupted. Progress saved; run again to resume.")
         pushover.notify_interrupted()
+        sys.exit(130)   # standard SIGINT exit; `cliclo && next-step` must not chain on
     except Exception as e:  # noqa: BLE001
         logger.error(f"Fatal error: {e}", exc_info=True)
         pushover.notify_crash(str(e))
         sys.exit(1)
+    finally:
+        # Always release the DB connection and lock file, on success, Ctrl-C, and
+        # crash alike. Leaving the .lock behind on every interrupt trains users to
+        # delete lock files, which defeats the lock.
+        if tagger is not None:
+            try:
+                tagger.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":

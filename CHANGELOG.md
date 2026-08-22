@@ -8,6 +8,43 @@
 
 ---
 
+## ISSUE #7 — v5.2.0
+### *"THE RECKONING!"*
+**On sale 2026-08-22**
+
+> **NARRATOR BOX:** *The machine had shipped. The crowds had cheered. But deep in its gears, glossed-over gremlins gnawed! Three inspectors descend at once — no stone unturned, no page lost, no lock left lying!*
+
+A deep-review release: three independent review passes over the whole program, every confirmed defect fixed. Focus areas were data safety, resume correctness, and honest failure modes.
+
+### Fixed — the repair pass was completely broken
+- **v5.1.3's streaming repack read pages through a closed archive handle**, so *every* repair attempt failed with "Repair write failed". The container is now reopened for the streaming phase. Regression-tested: a multi-chapter archive with colliding basenames repacks correctly again.
+- **Repack refuses to overwrite an existing `.cbz`.** A repack of `foo.cbr` could clobber an already-tagged good `foo.cbz` with a metadata-reset copy.
+- **Repack output is CRC-verified before it replaces anything.**
+
+### Fixed — data safety
+- **A pre-existing CBZ is integrity-checked before its CBR is touched.** Previously any file named `Title.cbz` beside `Title.cbr` — including a truncated partial left by a crashed conversion — caused the CBR to be marked "converted" and (with `--delete-cbr`) deleted. The only good copy of the pages could be destroyed.
+- **`--delete-original` is no longer passed to ComicTagger during conversion.** CLICLO CRC-verifies the produced CBZ itself and only then deletes the original; disk-full or a crash mid-write can no longer cost you the source archive.
+- **`--dedupe --confirm` compares content again before deleting.** The size-tolerance and signature safety net had been dropped — deletion was purely filename-based, so `Title (1).cbz` holding a *different scan* would be deleted. The new signature hashes every member's (name, size, CRC32) from the central directory, so two scans sharing page 001 can't collide either.
+
+### Fixed — resume & review correctness
+- **Library scans follow symlinked directories.** `rglob` never descends into dir symlinks, so symlinked subtrees (common on Unraid/mergerfs libraries) were silently skipped. The walk now follows links with cycle protection.
+- **`--review` asks instead of guessing when tags are unchanged.** For files that shipped with embedded release-group tags, an unchanged fingerprint is ambiguous between "reconfirmed the same match" and "skipped"; it was being recorded unconditionally (as success pre-5.1.3, as skip after). Now you're asked `t`/`s` — one keypress, correct forever.
+
+### Fixed — robustness & honest failures
+- **The DB lock is always released.** `close()` now runs on Ctrl-C and crashes too, so interrupts no longer leave a stale `.lock` that trains you to delete lock files. Ctrl-C exits with code 130, so `cliclo && next-step` chains stop correctly.
+- **Lock errors tell the truth.** An unwritable directory no longer masquerades as "another instance is running", and the message no longer invites deleting a live lock file.
+- **`--stats`, `--db-info`, `--show-failed` work without ComicTagger installed.** DB-only reads no longer probe the binary — or fire an emergency Pushover page when it's absent.
+- **Config values are validated.** Booleans accept `yes/no/on/off/1/0` (previously anything but the literal `true` silently meant false — `repair_failed_archives = 1` disabled repair!). Bad integers name the offending key instead of a bare traceback; a malformed ini fails with a clear parse error.
+- **API budget isn't charged for launches that never happened.** A missing/unexecutable ComicTagger binary no longer burns hourly ComicVine budget per attempt.
+- **Temp copies use unique names**, so a timed-out network copy's zombie writer can't interleave with a retry of the same file.
+- **`--test-pushover` distinguishes "disabled" from "failed".**
+
+### Verified
+- `py_compile` clean; `--help` and `--stats` (without ComicTagger on PATH) exit 0; lock file removed after run.
+- Behavior tests: repack of colliding-basename archive produces both pages CRC-clean; repack aborts beside an existing `.cbz`; corrupt CBZ fails `_cbz_ok` while a good one passes; two different scans with identical page names produce different dedupe signatures.
+
+---
+
 ## ISSUE #5⅞ — v5.1.2
 ### *"THE DRY RUN THAT WASN'T!"*
 **On sale 2026-07-01**
