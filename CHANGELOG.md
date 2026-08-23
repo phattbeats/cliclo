@@ -8,6 +8,41 @@
 
 ---
 
+## ISSUE #8 — v5.2.1
+### *"THE POLISHING!"*
+**On sale 2026-08-23**
+
+> **NARRATOR BOX:** *The gremlins routed, the presses cooling — but a true archivist knows the job isn't done until the masthead gleams and every caption tells the truth!*
+
+A cleanup release: one more review pass over the whole program, repo and doc
+tidy-up, and the banner finally makes its print debut atop the README.
+
+### Fixed
+- **`--dedupe` no longer demands the ComicTagger binary.** Dedupe is a purely
+  local file operation, but it was excluded from the DB-only command set, so a
+  box without ComicTagger died with a fatal error (and a priority-2 Pushover
+  page) before touching a single duplicate.
+- **`--dry-run` no longer sends milestone Pushover notifications.** A preview
+  run pushed real progress notifications to your phone.
+- **`--config cliclo.ini` is honored literally.** Passing the default filename
+  explicitly was treated as "not set" and silently resolved into the state
+  directory instead of the path you asked for.
+- **Large-network-file conversion refuses to overwrite an existing `.cbz`**,
+  matching the protection the normal conversion path already had.
+- **`--config-dir` help text no longer describes a fallback that never existed.**
+
+### Docs & repo
+- README opens with the CLICLO banner, as nature intended.
+- DOCS.md updated to v5.2.1: documents `--config-dir` and the per-user state
+  directory (`~/.config/cliclo` and friends), corrects the `--config` /
+  `db_path` default locations, notes `--test-pushover` is not part of the
+  mutually-exclusive action group, and fixes the status table
+  (`user_selected` / `user_reconfirmed` are match statuses on `success` rows).
+- README quick start explains where state lives on a clean first run.
+- Stale v5.1-era version strings scrubbed from the module docstring and comments.
+
+---
+
 ## ISSUE #7 — v5.2.0
 ### *"THE RECKONING!"*
 **On sale 2026-08-22**

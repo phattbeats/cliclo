@@ -4,7 +4,7 @@ Complete documentation of every feature, command, configuration key, and
 behavior in CLICLO. For a quick orientation, read the [README](README.md)
 first; this document is the exhaustive reference.
 
-Applies to CLICLO v5.1.1.
+Applies to CLICLO v5.2.1.
 
 ---
 
@@ -105,7 +105,9 @@ Exactly one of these may be given; with none, CLICLO runs pass 1.
 | `--dedupe` | List numbered duplicate CBZs (` (1).cbz` … ` (999).cbz` next to a base file). Dry-run unless `--confirm` is added. |
 | `--reset-db` | Delete the progress database and exit. |
 | `--init-config` | Write a default `cliclo.ini` and exit. |
-| `--test-pushover` | Send a test notification and exit. |
+
+`--test-pushover` (send a test notification and exit) also acts alone, but is
+not part of the mutually-exclusive group.
 
 ### Path / connection options
 
@@ -116,7 +118,8 @@ Exactly one of these may be given; with none, CLICLO runs pass 1.
 | `--api-key KEY` | ComicVine API key (overrides config and env). |
 | `--api-keys K1,K2` | **Experimental** comma-separated extra keys for rotation. See [Experimental features](#experimental-features). |
 | `--db-path FILE` | Progress database file. Point at an older run's DB to resume it. |
-| `--config FILE` | Config file path (default `cliclo.ini`). |
+| `--config FILE` | Config file path (default: `cliclo.ini` in the state directory, see below). |
+| `--config-dir DIR` | State directory for `cliclo.ini`, the progress DB, and `cliclo.log`. Default: the platform user-config dir (`~/.config/cliclo` on Linux, `%LOCALAPPDATA%\CLICLO` on Windows, `~/Library/Application Support/CLICLO` on macOS). If legacy state files already sit in the current directory, that directory is used instead so in-place upgrades keep working. |
 | `--proxy URL` | **Experimental** HTTP(S) proxy for ComicVine requests, e.g. `http://192.168.1.10:8118`. |
 | `--rotate-egress` | **Experimental** bind each API key to its own egress route (requires proxy + 2+ keys). |
 
@@ -162,7 +165,7 @@ All keys, with defaults:
 | `repair_failed_archives` | `true` | Attempt the tolerant repack on recoverable conversion failures. |
 | `proxy` | *(blank)* | Experimental HTTP(S) proxy for ComicVine calls. |
 | `rotate_egress` | `false` | Experimental per-key egress binding (needs proxy + 2+ keys). |
-| `db_path` | `cliclo_progress.db` | Progress database file. |
+| `db_path` | `cliclo_progress.db` | Progress database file, resolved inside the state directory (see `--config-dir`) unless an absolute path is given. |
 | `pushover_api_token` | *(blank)* | Pushover application token. |
 | `pushover_user_key` | *(blank)* | Pushover user key. |
 | `pushover_device` | *(blank)* | Optional target device name. |
@@ -213,7 +216,8 @@ Per-file outcomes recorded (visible in `--db-info` / `--show-failed`):
 | Status | Meaning |
 | --- | --- |
 | `success` | Tagged with a confident match. |
-| `user_selected` | Tagged with a match you chose in `--review`. |
+| `success` + `user_selected` | Tagged with a match you chose in `--review` (stored as `success` with match status `user_selected`). |
+| `success` + `user_reconfirmed` | Tagged after you re-confirmed a low-confidence match in `--review`. |
 | `converted` | CBR converted to CBZ (tagging outcome recorded separately). |
 | `needs_followup` | In the review queue (multiple / low-confidence / no match). |
 | `error` | Transient failure; eligible for `--retry-failed` up to `max_retries`. |

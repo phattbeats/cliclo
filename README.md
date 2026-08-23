@@ -1,3 +1,13 @@
+```text
+ ██████╗██╗     ██╗ ██████╗██╗      ██████╗
+██╔════╝██║     ██║██╔════╝██║     ██╔═══██╗
+██║     ██║     ██║██║     ██║     ██║   ██║
+██║     ██║     ██║██║     ██║     ██║   ██║
+╚██████╗███████╗██║╚██████╗███████╗╚██████╔╝
+ ╚═════╝╚══════╝╚═╝ ╚═════╝╚══════╝ ╚═════╝
+      ★  ASTOUNDING TALES OF AUTOMATION  ★
+```
+
 # CLICLO
 
 **C**ommand **L**ine **I**nterface **C**omic **L**ibrary **O**rganizer.
@@ -85,6 +95,13 @@ python cliclo.py
 
 That first run tags everything it can match confidently. Interrupt any time;
 run it again to resume.
+
+A `cliclo.ini` in the working directory (as above) is always honored. On a
+clean first run with no local config, CLICLO instead keeps its config,
+progress database, and log in a per-user state directory —
+`~/.config/cliclo` on Linux, `%LOCALAPPDATA%\CLICLO` on Windows,
+`~/Library/Application Support/CLICLO` on macOS — overridable with
+`--config-dir`.
 
 ---
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-CLICLO v5.1 - Command Line Interface Comic Library Organizer
+CLICLO - Command Line Interface Comic Library Organizer
 Automated comic metadata tagging via ComicTagger's CLI.
 
-THE THREE-PASS PIPELINE (v5.1):
+THE THREE-PASS PIPELINE:
   Pass 1  (default run)     High-confidence auto-tag. The bulk of a library.
   Pass 2  (--auto-retry)    Automated re-match of the leftover queue: drops the
                             year, searches by series name, KEEPS the confidence
@@ -95,7 +95,7 @@ else:
 
 logger = logging.getLogger("cliclo")
 
-VERSION = "5.2.0"
+VERSION = "5.2.1"
 SCHEMA_VERSION = 6
 
 BANNER_WIDTH = 63
@@ -286,9 +286,7 @@ def resolve_config_path(args, state_dir: str) -> str:
     upgrading in place) so we never silently strand an existing config.
     """
     explicit = getattr(args, "config", None)
-    # argparse default is CONFIG_FILE (which is the bare filename "cliclo.ini"),
-    # so a None-or-equal-to-default means "not set on the command line".
-    if explicit and explicit != CONFIG_FILE:
+    if explicit:
         return explicit
     legacy_cwd = os.path.join(os.getcwd(), CONFIG_FILE)
     if os.path.exists(legacy_cwd):
@@ -1151,6 +1149,11 @@ class CLICLOTagger:
                 self._safe_unlink(local)
                 return None
             final = cbr.with_suffix(".cbz")
+            if final.exists():
+                logger.error(f"    Refusing to overwrite existing {final.name}")
+                self._safe_unlink(local)
+                self._safe_unlink(result)
+                return None
             try:
                 shutil.move(str(result), str(final))
                 self._safe_unlink(local)
@@ -1810,7 +1813,8 @@ class CLICLOTagger:
                 eta = (total - i) / rate / 60 if rate else 0
                 logger.info(f"\n--- {i}/{total} ({i * 100 / total:.1f}%) | "
                             f"{rate:.2f}/s | ETA {eta:.1f} min ---")
-                self.pushover.notify_milestone(i, total, self.db.get_stats(), el / 3600)
+                if not self.dry_run:
+                    self.pushover.notify_milestone(i, total, self.db.get_stats(), el / 3600)
 
             try:
                 if comic.suffix.lower() == ".cbr":
@@ -2289,15 +2293,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     # `--version` is added with `prog=cliclo` above so the standard action="version"
-    # prints "cliclo 5.1.2" instead of argparse's default "<prog>.py 5.1.2". Keeps
+    # prints "cliclo <version>" instead of argparse's default "<prog>.py <version>". Keeps
     # `cliclo --version` tidy for cron / scripting.
     p.add_argument("--version", action="version", version=f"cliclo {VERSION}")
     p.add_argument("--config-dir",
                    help="Directory for cliclo.ini, the progress DB, and the log "
                         "(default: platform-specific user config dir, e.g. "
-                        "~/.config/cliclo on Linux). Falls back to CWD if --config "
-                        "or --db-path is set explicitly, or if legacy state files "
-                        "already live in CWD.")
+                        "~/.config/cliclo on Linux). Falls back to CWD if legacy "
+                        "state files already live there.")
     p.add_argument("path", nargs="?", help="Comics directory (overrides config)")
     p.add_argument("--comics-path", help="Override comics path")
     p.add_argument("--comictagger-path", help="ComicTagger install dir or binary")
@@ -2311,7 +2314,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="EXPERIMENTAL: bind each key to its own egress (key 1 direct, key 2 via "
                         "--proxy, ...) so each exits a different IP. Needs a proxy that is a "
                         "genuinely different public IP. Off by default.")
-    p.add_argument("--config", default=CONFIG_FILE, help="Config file path")
+    p.add_argument("--config", default=None, help="Config file path")
 
     actions = p.add_mutually_exclusive_group()
     actions.add_argument("--test", metavar="FILE", help="Tag one file and print the result")
@@ -2468,7 +2471,7 @@ def main():
     tagger = None
     try:
         # DB-only commands don't need the ComicTagger binary at all.
-        db_only = args.stats or args.db_info or args.show_failed
+        db_only = args.stats or args.db_info or args.show_failed or args.dedupe
         tagger = CLICLOTagger(config, pushover, need_exe=not db_only)
         tagger.dry_run = args.dry_run
         tagger.accept_low_confidence = args.accept_low_confidence

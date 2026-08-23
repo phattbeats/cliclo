@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cliclo"
-version = "5.2.0"
+version = "5.2.1"
 description = "Command Line Interface Comic Library Organizer — batch-tagging a comic library with ComicVine metadata by driving the ComicTagger CLI."
 readme = "README.md"
 license = { file = "LICENSE" }
